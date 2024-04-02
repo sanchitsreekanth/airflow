@@ -22,29 +22,17 @@ from enum import Enum
 from functools import cached_property
 from json import JSONDecodeError
 from typing import Any, Sequence, Set
+from urllib.parse import urljoin
 
 import requests
-from requests.models import DEFAULT_REDIRECT_LIMIT, HTTPError
+from requests.auth import AuthBase
+from requests.models import DEFAULT_REDIRECT_LIMIT, PreparedRequest
 
-from airflow.hooks.base import BaseHook
+from airflow.providers.http.hooks.http import HttpHook
 
 
 class DremioException(Exception):
     """Dremio Exception class."""
-
-
-def _trim_trailing_slash(url: str) -> str:
-    """Remove trailing / from url."""
-    if url.endswith("/"):
-        return url[:-1]
-    return url
-
-
-def _url_from_endpoint(base_url: str | None, endpoint: str | None) -> str:
-    """Combine base url with endpoint."""
-    if base_url and not base_url.endswith("/") and endpoint and not endpoint.startswith("/"):
-        return f"{base_url}/{endpoint}"
-    return (base_url or "") + (endpoint or "")
 
 
 def _jsonify(obj: Any) -> dict:
@@ -62,6 +50,30 @@ def _jsonify(obj: Any) -> dict:
         return obj
     else:
         return {}
+
+
+def _get_provider_info() -> tuple[str, str]:
+    from airflow.providers_manager import ProvidersManager
+
+    manager = ProvidersManager()
+    package_name = manager.hooks[DremioHook.conn_type].package_name  # type: ignore[union-attr]
+    provider = manager.providers[package_name]
+
+    return package_name, provider.version
+
+
+class TokenAuth(AuthBase):
+    """Class for token based auth for dremio."""
+
+    def __init__(self, token: str):
+        self.token = token
+
+    def __call__(self, request: PreparedRequest) -> PreparedRequest:
+        package_name, provider_version = _get_provider_info()
+        request.headers["User-Agent"] = f"{package_name}-v{provider_version}"
+        request.headers["Content-Type"] = "application/json"
+        request.headers["Authorization"] = f"Token {self.token}"
+        return request
 
 
 class ReflectionRefreshStatus(Enum):
@@ -101,7 +113,7 @@ class ReflectionRefreshStatus(Enum):
 
     @classmethod
     def validate(cls, states: str | Sequence[str] | set[str]):
-        if isinstance(states, (Sequence, Set)):
+        if isinstance(states, (Sequence, Set)) and not isinstance(states, str):
             for state in states:
                 cls(state)
         else:
@@ -115,7 +127,7 @@ class ReflectionRefreshStatus(Enum):
         return state in cls.TERMINAL_STATES.value
 
 
-class DremioHook(BaseHook):
+class DremioHook(HttpHook):
     """Interacts with Dremio Cluster using Dremio REST APIs."""
 
     conn_attr_name = "dremio_conn_id"
@@ -135,36 +147,21 @@ class DremioHook(BaseHook):
         self.dremio_conn_id = dremio_conn_id
         self.api_version = api_version
         self.headers = headers or {"Content-Type": "application/json"}
+        kwargs["auth_type"] = TokenAuth
         super().__init__(*args, **kwargs)
 
     @cached_property
-    def url(self) -> str:
-        conn = self.get_connection(conn_id=self.dremio_conn_id)
-        base_url = ""
-        host = _trim_trailing_slash(conn.host) if conn.host else ""
-        if "://" in host:
-            base_url = base_url + host
-        else:
-            schema = conn.schema if conn.schema else "http"
-            base_url = f"{schema}://{host}"
-
-        if conn.port:
-            base_url = f"{base_url}:{conn.port}"
-
-        return base_url
-
-    @cached_property
-    def auth_headers(self) -> dict:
+    def token(self) -> str:
         conn = self.get_connection(conn_id=self.dremio_conn_id)
         extra = conn.extra_dejson if conn.extra else {}
         if not extra:
-            return {}
+            return ""
 
         auth = extra.get("auth", None)
-        pat = extra.get("pat", None)
+        pat = extra.get("pat", "")
         if not auth:
             self.log.info("No authentication provided for Dremio")
-            return {}
+            return ""
 
         if auth and auth not in ("AuthToken", "PAT"):
             raise ValueError(
@@ -178,7 +175,7 @@ class DremioHook(BaseHook):
                 )
 
             token = self.__fetch_auth_token(conn.login, conn.password)
-            return {"Authorization": f"_dremio{token}"}
+            return f"_dremio{token}"
 
         elif auth == "PAT":
             if conn.extra and not pat:
@@ -186,107 +183,88 @@ class DremioHook(BaseHook):
                     "Auth method 'PAT' requires a value for key 'pat' in connection extra fields which contains value for the pat token"
                 )
 
-            return {"Authorization": f"Bearer {pat}"}
+            return pat
 
         else:
-            return {}
+            return ""
+
+    @cached_property
+    def dremio_url(self):
+        conn = self.get_connection(self.dremio_conn_id)
+        if conn.host and "://" in conn.host:
+            base_url = conn.host
+        else:
+            # schema defaults to HTTP
+            schema = conn.schema if conn.schema else "http"
+            host = conn.host if conn.host else ""
+            base_url = f"{schema}://{host}"
+
+        if conn.port:
+            base_url += f":{conn.port}"
+
+        return base_url
 
     def __fetch_auth_token(self, username: str, password: str):
-        token_url = _url_from_endpoint(base_url=self.url, endpoint="apiv2/login")
+        token_url = urljoin(self.base_url, "apiv2/login")
         data = json.dumps({"userName": username, "password": password})
         headers = {"Content-Type": "application/json"}
         response = requests.post(url=token_url, data=data, headers=headers)
-        self.handle_response(response)
+        self.check_response(response)
         return response.json().get("token")
 
-    def get_conn(self) -> requests.Session:
+    def get_conn(self, headers: dict[Any, Any] | None = None) -> requests.Session:
         session = requests.Session()
-        conn = self.get_connection(conn_id=self.dremio_conn_id)
+        if self.dremio_conn_id:
+            conn = self.get_connection(self.http_conn_id)
+            self.base_url = self.dremio_url
 
-        host = conn.host if conn.host else ""
-        if not host:
-            raise DremioException(
-                f"The connection {self.dremio_conn_id} does not have the dremio hostname set. "
-                f"Please give a valid hostname in the airflow connection"
-            )
-
-        if conn.extra:
-            extra = conn.extra_dejson
-            extra.pop("timeout", None)  # ignore this as timeout is only accepted in request method of Session
-            extra.pop("allow_redirects", None)  # ignore this as only max_redirects is accepted in Session
-            session.proxies = extra.pop("proxies", extra.pop("proxy", {}))
-            session.stream = extra.pop("stream", False)
-            session.verify = extra.pop("verify", extra.pop("verify_ssl", True))
-            session.cert = extra.pop("cert", None)
-            session.max_redirects = extra.pop("max_redirects", DEFAULT_REDIRECT_LIMIT)
-
-            try:
-                session.headers.update(extra)
-            except TypeError:
-                self.log.warning("Connection to %s has invalid extra field.", conn.host)
-
-        if self.headers:
-            session.headers.update(self.headers)
-
-        auth_headers = self.auth_headers
-        session.headers.update(auth_headers)
-
+            session.auth = TokenAuth(token=self.token)
+            if conn.extra:
+                extra = conn.extra_dejson
+                extra.pop(
+                    "timeout", None
+                )  # ignore this as timeout is only accepted in request method of Session
+                extra.pop("allow_redirects", None)  # ignore this as only max_redirects is accepted in Session
+                session.proxies = extra.pop("proxies", extra.pop("proxy", {}))
+                session.stream = extra.pop("stream", False)
+                session.verify = extra.pop("verify", extra.pop("verify_ssl", True))
+                session.cert = extra.pop("cert", None)
+                session.max_redirects = extra.pop("max_redirects", DEFAULT_REDIRECT_LIMIT)
         return session
 
-    def handle_response(self, response: requests.Response):
-        try:
-            response.raise_for_status()
-        except HTTPError:
-            self.log.error(response.text)
-            raise DremioException(
-                f"Failed to send HTTP request to Dremio - {str(response.status_code)} : {response.reason}"
-            )
-
-    def run(
-        self, method: str, endpoint: str, body: dict | str | None = None, params: dict | str | None = None
+    def run_and_get_response(
+        self, method: str, endpoint: str, data: dict | str | None = None, headers: dict | str | None = None
     ):
-        body = _jsonify(body)
-        params = _jsonify(params)
+        data = _jsonify(data)
+        headers = {**_jsonify(headers)}
         method = method.upper()
-        base_url = _url_from_endpoint(base_url=self.url, endpoint=self.api_version)
-        url = _url_from_endpoint(base_url=base_url, endpoint=endpoint)
-        session = self.get_conn()
-
-        if method == "GET":
-            request = requests.Request("GET", url=url, params=params, headers=session.headers)
-
-        else:
-            request = requests.Request(method, url=url, data=json.dumps(body), headers=session.headers)
-
-        prepped_request = session.prepare_request(request)
-        response = session.send(prepped_request)
-        self.handle_response(response)
-        if response.text:
-            return response.json()
+        self.method = method
+        response = self.run(endpoint=endpoint, data=data, headers=headers)
+        return response.json()
 
     def execute_sql_query(self, sql: str, **sql_kwargs):
         body = {**{"sql": sql, **sql_kwargs}}
         self.log.info("Executing SQL query %s", sql)
-        response = self.run(method="POST", body=body, endpoint="sql")
+        response = self.run_and_get_response(method="POST", data=body, endpoint="sql")
         return response
 
     def get_catalog_by_path(self, path: str, **kwargs):
-        return self.run(method="GET", params=kwargs, endpoint=f"catalog/by-path/{path}")
+        return self.run_and_get_response(method="GET", data=kwargs, endpoint=f"catalog/by-path/{path}")
 
     def get_catalog(self, catalog_id: str, **kwargs):
-        return self.run(method="GET", params=kwargs, endpoint=f"catalog/{catalog_id}")
+        return self.run_and_get_response(method="GET", data=kwargs, endpoint=f"catalog/{catalog_id}")
 
     def get_reflection(self, reflection_id: str):
-        return self.run(method="GET", endpoint=f"reflection/{reflection_id}")
+        return self.run_and_get_response(method="GET", endpoint=f"reflection/{reflection_id}")
 
     def create_reflection(self, reflection_spec: dict):
-        return self.run(method="POST", endpoint="reflection", body=reflection_spec)
+        return self.run_and_get_response(method="POST", endpoint="reflection", data=reflection_spec)
 
     def update_reflection(self, reflection_id: str, spec: dict):
-        return self.run(method="PUT", endpoint=f"reflection/{reflection_id}", body=spec)
+        return self.run_and_get_response(method="PUT", endpoint=f"reflection/{reflection_id}", data=spec)
 
     def get_dataset_reflection(self, dataset_id: str):
-        return self.run(method="GET", endpoint=f"dataset/{dataset_id}/reflection")
+        return self.run_and_get_response(method="GET", endpoint=f"dataset/{dataset_id}/reflection")
 
     def get_reflections_for_source(self, source: str):
         dataset_id = self.get_catalog_by_path(path=source.replace(".", "/")).get("id")
@@ -294,10 +272,10 @@ class DremioHook(BaseHook):
         return response.get("data")
 
     def get_job(self, job_id: str):
-        return self.run(method="GET", endpoint=f"job/{job_id}")
+        return self.run_and_get_response(method="GET", endpoint=f"job/{job_id}")
 
     def get_job_results(self, job_id):
-        return self.run(method="GET", endpoint=f"job/{job_id}/results")
+        return self.run_and_get_response(method="GET", endpoint=f"job/{job_id}/results")
 
     def refresh_table_metadata(self, table: str, context: list[str] | None = None):
         sql = f"ALTER TABLE {table} REFRESH METADATA"
@@ -307,7 +285,7 @@ class DremioHook(BaseHook):
         return job_id
 
     def trigger_reflection_refresh(self, dataset_id: str):
-        return self.run(method="POST", endpoint=f"catalog/{dataset_id}/refresh", body={})
+        return self.run_and_get_response(method="POST", endpoint=f"catalog/{dataset_id}/refresh", data={})
 
     def set_property(self, property_name: str, value: str, level: str = "system"):
         return self.execute_sql_query(sql=f"ALTER {level.upper()} SET {property_name} = {value}")

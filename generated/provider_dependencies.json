@@ -441,10 +441,13 @@
   "dremio": {
     "deps": [
       "Cerberus==1.3.5",
+      "apache-airflow-providers-http",
       "apache-airflow>=2.6.0"
     ],
     "devel-deps": [],
-    "cross-providers-deps": [],
+    "cross-providers-deps": [
+      "http"
+    ],
     "excluded-python-versions": [],
     "state": "ready"
   },

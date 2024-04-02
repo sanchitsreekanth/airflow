@@ -14,37 +14,3 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-
----
-package-name: apache-airflow-providers-dremio
-name: Dremio
-description: |
-    `Dremio <https://www.dremio.com/>`__
-
-state: ready
-source-date-epoch: 1708864826
-versions:
-  - 1.0.0
-
-dependencies:
-  - apache-airflow>=2.6.0
-  - apache-airflow-providers-http
-  - Cerberus==1.3.5
-
-integrations:
-  - integration-name: Dremio
-    external-doc-url: https://www.dremio.com/
-    how-to-guide:
-      - /docs/apache-airflow-providers-dremio/operators/dremio.rst
-    logo: /integration-logos/dremio/Dremio.png
-    tags: [software]
-
-hooks:
-  - integration-name: Dremio
-    python-modules:
-      - airflow.providers.dremio.hooks.dremio
-
-operators:
-  - integration-name: Dremio
-    python-modules:
-      - airflow.providers.dremio.operators.dremio

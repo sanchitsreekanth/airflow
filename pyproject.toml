@@ -698,6 +698,7 @@ docker = [ # source: airflow/providers/docker/provider.yaml
 ]
 dremio = [ # source: airflow/providers/dremio/provider.yaml
   "Cerberus==1.3.5",
+  "apache-airflow[http]",
 ]
 elasticsearch = [ # source: airflow/providers/elasticsearch/provider.yaml
   "apache-airflow[common_sql]",
