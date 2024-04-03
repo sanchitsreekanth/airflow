@@ -23,7 +23,12 @@ import pytest
 from requests import Response
 
 from airflow.models import Connection
-from airflow.providers.dremio.hooks.dremio import DremioHook, ReflectionRefreshStatus, TokenAuth
+from airflow.providers.dremio.hooks.dremio import (
+    DremioException,
+    DremioHook,
+    ReflectionRefreshStatus,
+    TokenAuth,
+)
 from airflow.utils import db
 
 
@@ -223,3 +228,56 @@ class TestDremioHook:
         hook = DremioHook(dremio_conn_id=DREMIO_CONN_ID)
         hook.execute_sql_query(sql="SELECT * FROM TEST")
         run_mock.assert_called_with(endpoint="sql", data={"sql": "SELECT * FROM TEST"}, headers={})
+        assert hook.method == "POST"
+
+    @patch("airflow.providers.http.hooks.http.HttpHook.run")
+    def test_get_catalog_by_path(self, run_mock):
+        run_mock.return_value = get_mock_response(code=200, response_body={"datasetId": 123})
+        hook = DremioHook(dremio_conn_id=DREMIO_CONN_ID)
+        hook.get_catalog_by_path(path="source/schema/table")
+        run_mock.assert_called_with(endpoint="catalog/by-path/source/schema/table", data={}, headers={})
+        assert hook.method == "GET"
+
+    @patch("airflow.providers.http.hooks.http.HttpHook.run")
+    def test_get_reflection_status(self, run_mock):
+        run_mock.return_value = get_mock_response(
+            code=200, response_body={"status": {"combinedStatus": "CAN_ACCELERATE"}}
+        )
+        hook = DremioHook(dremio_conn_id=DREMIO_CONN_ID)
+        status = hook.get_reflection_status(reflection_id="12345")
+        assert status == "CAN_ACCELERATE"
+        run_mock.assert_called_with(endpoint="reflection/12345", data={}, headers={})
+        assert hook.method == "GET"
+
+    @patch("airflow.providers.http.hooks.http.HttpHook.run")
+    def test_refresh_table_metadata(self, run_mock):
+        run_mock.return_value = get_mock_response(code=200, response_body={"id": "111111"})
+        hook = DremioHook(dremio_conn_id=DREMIO_CONN_ID)
+        job_id = hook.refresh_table_metadata(table="schema.table")
+        assert job_id == "111111"
+        run_mock.assert_called_with(
+            endpoint="sql", data={"sql": "ALTER TABLE schema.table REFRESH METADATA"}, headers={}
+        )
+        assert hook.method == "POST"
+
+    @patch("airflow.providers.http.hooks.http.HttpHook.run")
+    def test_wait_for_completion(self, run_mock):
+        run_mock.side_effect = [
+            get_mock_response(code=200, response_body={"status": {"combinedStatus": "REFRESHING"}}),
+            get_mock_response(code=200, response_body={"status": {"combinedStatus": "CAN_ACCELERATE"}}),
+        ]
+        hook = DremioHook(dremio_conn_id=DREMIO_CONN_ID)
+        complete = hook.wait_for_reflection_completion(reflection_id="123", check_interval=5)
+        assert complete
+        assert run_mock.call_count == 2
+
+    @patch("airflow.providers.http.hooks.http.HttpHook.run")
+    def test_wait_for_completion_raises_exception_on_timeout(self, run_mock):
+        run_mock.side_effect = [
+            get_mock_response(code=200, response_body={"status": {"combinedStatus": "REFRESHING"}}),
+            get_mock_response(code=200, response_body={"status": {"combinedStatus": "REFRESHING"}}),
+            get_mock_response(code=200, response_body={"status": {"combinedStatus": "CAN_ACCELERATE"}}),
+        ]
+        hook = DremioHook(dremio_conn_id=DREMIO_CONN_ID)
+        with pytest.raises(DremioException):
+            hook.wait_for_reflection_completion(reflection_id="123", check_interval=5, timeout=4)
