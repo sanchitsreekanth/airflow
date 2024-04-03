@@ -18,12 +18,14 @@
 from __future__ import annotations
 
 import json
+import time
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, Sequence
 
 from airflow.configuration import conf
 from airflow.models import BaseOperator
 from airflow.providers.dremio.hooks.dremio import DremioException, DremioHook
+from airflow.providers.dremio.triggers.dremio import ReflectionRefreshTrigger
 
 if TYPE_CHECKING:
     from airflow.utils.context import Context
@@ -220,7 +222,17 @@ class DremioCreateReflectionOperator(BaseOperator):
             )
 
     def execute_async(self, reflection_id: str, context: Context):
-        pass
+        timeout = time.time() + self.timeout
+        self.defer(
+            trigger=ReflectionRefreshTrigger(
+                conn_id=self.dremio_conn_id,
+                reflection_id=reflection_id,
+                check_interval=self.check_interval,
+                timeout=timeout,
+            ),
+            method_name="execute_complete",
+            timeout=self.execution_timeout,
+        )
 
     def execute_sync(self, reflection_id: str):
         if self.hook.wait_for_reflection_completion(
@@ -229,3 +241,14 @@ class DremioCreateReflectionOperator(BaseOperator):
             self.log.info("Reflection %s has completed successfully", reflection_id)
         else:
             raise DremioException(f"Reflection refresh has failed for reflection id {reflection_id}")
+
+    def execute_complete(self, context: Context, event: dict[str, Any]) -> str:
+        status = event.get("status")
+        message = event.get("message")
+        reflection_id = event.get("reflection_id")
+        self.log.info(message)
+        if status == "disabled":
+            raise DremioException(f"{reflection_id} reflection has been disabled")
+        if status == "error":
+            raise DremioException(f"Reflection refresh for {reflection_id} has failed")
+        return str(reflection_id)
